@@ -1,0 +1,8 @@
+[project]
+name = "babushka-god-mode"
+version = "0.1.0"
+description = "Babushka God Mode — full email management MCP server"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.26.0",
+]
