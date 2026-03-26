@@ -2,6 +2,7 @@
 # ABOUTME: Supports multiple accounts (iCloud, Gmail, Outlook) simultaneously.
 
 import json
+import os
 import re
 import imaplib
 import email
@@ -42,6 +43,14 @@ ACCOUNT_PARAM = {
     }
 }
 
+FROM_FOLDER_PARAM = {
+    "from_folder": {
+        "type": "string",
+        "description": "Source folder (defaults to INBOX).",
+        "default": "INBOX",
+    }
+}
+
 
 def get_config():
     if not CONFIG_PATH.exists():
@@ -65,22 +74,39 @@ def get_accounts(config):
     return []
 
 
+def _get_password(account):
+    """Get password from env var (preferred) or config.json fallback."""
+    # Env var convention: BABUSHKA_<NAME>_PASSWORD (e.g. BABUSHKA_ICLOUD_PASSWORD)
+    name = account.get("name", account.get("provider", "default"))
+    env_key = f"BABUSHKA_{name.upper().replace(' ', '_')}_PASSWORD"
+    return os.environ.get(env_key) or account.get("password", "")
+
+
 def resolve_account(config, account_name=""):
     """Resolve an account by name, provider, or default to first."""
     accounts = get_accounts(config)
     if not accounts:
         return None
     if not account_name:
-        return accounts[0]
-    # Exact name match (case-insensitive)
-    for acc in accounts:
-        if acc.get("name", "").lower() == account_name.lower():
-            return acc
-    # Fuzzy match on provider
-    for acc in accounts:
-        if acc.get("provider", "").lower() == account_name.lower():
-            return acc
-    return accounts[0]
+        acc = accounts[0]
+    else:
+        acc = None
+        # Exact name match (case-insensitive)
+        for a in accounts:
+            if a.get("name", "").lower() == account_name.lower():
+                acc = a
+                break
+        # Fuzzy match on provider
+        if acc is None:
+            for a in accounts:
+                if a.get("provider", "").lower() == account_name.lower():
+                    acc = a
+                    break
+        if acc is None:
+            acc = accounts[0]
+    # Inject password from env var if available
+    acc["password"] = _get_password(acc)
+    return acc
 
 
 def get_imap_connection(account):
@@ -175,8 +201,8 @@ def get_folder(account, role):
 
 
 def _imap_folder(name):
-    """Quote an IMAP folder name if it contains special characters."""
-    if any(c in name for c in " []/"):
+    """Quote an IMAP folder name if it contains special characters or non-ASCII."""
+    if any(c in name for c in ' []/') or not name.isascii():
         return f'"{name}"'
     return name
 
@@ -226,10 +252,10 @@ async def list_tools():
         ),
         Tool(
             name="babushka_archive_email",
-            description="Archive an email by moving it out of INBOX. On iCloud this moves to Archive folder.",
+            description="Archive an email by moving it to the Archive folder.",
             inputSchema={
                 "type": "object",
-                "properties": _props({
+                "properties": _props(FROM_FOLDER_PARAM, {
                     "uid": {"type": "string", "description": "Email UID to archive"},
                 }),
                 "required": ["uid"],
@@ -240,7 +266,7 @@ async def list_tools():
             description="Move an email to the Junk/Spam folder.",
             inputSchema={
                 "type": "object",
-                "properties": _props({
+                "properties": _props(FROM_FOLDER_PARAM, {
                     "uid": {"type": "string", "description": "Email UID to junk"},
                 }),
                 "required": ["uid"],
@@ -251,7 +277,7 @@ async def list_tools():
             description="Move an email to the Trash folder.",
             inputSchema={
                 "type": "object",
-                "properties": _props({
+                "properties": _props(FROM_FOLDER_PARAM, {
                     "uid": {"type": "string", "description": "Email UID to trash"},
                 }),
                 "required": ["uid"],
@@ -262,7 +288,7 @@ async def list_tools():
             description="Move an email to a specific folder.",
             inputSchema={
                 "type": "object",
-                "properties": _props({
+                "properties": _props(FROM_FOLDER_PARAM, {
                     "uid": {"type": "string", "description": "Email UID to move"},
                     "to_folder": {"type": "string", "description": "Destination folder name"},
                 }),
@@ -329,6 +355,23 @@ async def call_tool(name: str, arguments: dict):
 
     account_label = account.get("name", account.get("provider", "default"))
 
+    # Handle send_email separately — only needs SMTP, not IMAP
+    if name == "babushka_send_email":
+        to_addr = arguments["to"]
+        subject = arguments["subject"]
+        body = arguments["body"]
+        msg = MIMEText(body)
+        msg["From"] = account["email"]
+        msg["To"] = to_addr
+        msg["Subject"] = subject
+        try:
+            smtp = get_smtp_connection(account)
+            smtp.send_message(msg)
+            smtp.quit()
+        except Exception as e:
+            return [TextContent(type="text", text=f"Send failed ({account_label}): {e}")]
+        return [TextContent(type="text", text=f"Sent email to {to_addr}: {subject} ({account_label})")]
+
     try:
         conn = get_imap_connection(account)
     except Exception as e:
@@ -346,21 +389,36 @@ async def call_tool(name: str, arguments: dict):
             uids.reverse()
 
             emails = []
-            for uid in uids:
-                _, msg_data = conn.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
-                if msg_data[0] is None:
-                    continue
-                raw = msg_data[0][1]
-                msg = email.message_from_bytes(raw)
-                sender_name, sender_addr = parseaddr(msg.get("From", ""))
-                emails.append({
-                    "uid": uid.decode(),
-                    "from_name": sender_name,
-                    "from_email": sender_addr,
-                    "subject": decode_subject(msg),
-                    "date": msg.get("Date", ""),
-                    "account": account_label,
-                })
+            if uids:
+                # Batch fetch all headers in one IMAP command
+                uid_set = b",".join(uids)
+                _, msg_data = conn.uid("fetch", uid_set, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+                # IMAP returns pairs: (header_bytes, body_bytes) followed by b')'
+                uid_header_map = {}
+                for i in range(0, len(msg_data)):
+                    item = msg_data[i]
+                    if not isinstance(item, tuple) or len(item) < 2:
+                        continue
+                    # Extract UID from the response line, e.g. b'5 (UID 123 BODY[...]'
+                    meta = item[0]
+                    uid_match = re.search(rb'UID\s+(\d+)', meta)
+                    if uid_match:
+                        uid_header_map[uid_match.group(1)] = item[1]
+
+                for uid in uids:
+                    raw = uid_header_map.get(uid)
+                    if raw is None:
+                        continue
+                    msg = email.message_from_bytes(raw)
+                    sender_name, sender_addr = parseaddr(msg.get("From", ""))
+                    emails.append({
+                        "uid": uid.decode(),
+                        "from_name": sender_name,
+                        "from_email": sender_addr,
+                        "subject": decode_subject(msg),
+                        "date": msg.get("Date", ""),
+                        "account": account_label,
+                    })
 
             return [TextContent(type="text", text=json.dumps(emails, indent=2))]
 
@@ -400,7 +458,7 @@ async def call_tool(name: str, arguments: dict):
             html = get_html_body(msg)
             if not html:
                 return [TextContent(type="text", text=f"No HTML body found in this email ({account_label})")]
-            unsub_links = re.findall(r'href="([^"]*(?:unsubscribe|opt.out|remove)[^"]*)"', html, re.IGNORECASE)
+            unsub_links = re.findall(r'href="([^"]*(?:unsubscribe|opt[._-]?out|remove)[^"]*)"', html, re.IGNORECASE)
             result = {
                 "uid": uid,
                 "html_preview": html[:4000],
@@ -412,7 +470,7 @@ async def call_tool(name: str, arguments: dict):
         elif name == "babushka_archive_email":
             uid = arguments["uid"]
             provider = account.get("provider", "icloud")
-            conn.select("INBOX")
+            conn.select(_imap_folder(arguments.get("from_folder", "INBOX")))
             if provider == "gmail":
                 # Gmail doesn't support MOVE. Archive = COPY to All Mail + delete from INBOX.
                 conn.uid("COPY", uid, _imap_folder("[Gmail]/All Mail"))
@@ -426,7 +484,7 @@ async def call_tool(name: str, arguments: dict):
         elif name == "babushka_junk_email":
             uid = arguments["uid"]
             folder = get_folder(account, "junk")
-            conn.select("INBOX")
+            conn.select(_imap_folder(arguments.get("from_folder", "INBOX")))
             if account.get("provider") == "gmail":
                 conn.uid("COPY", uid, _imap_folder(folder))
                 conn.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
@@ -438,7 +496,7 @@ async def call_tool(name: str, arguments: dict):
         elif name == "babushka_trash_email":
             uid = arguments["uid"]
             folder = get_folder(account, "trash")
-            conn.select("INBOX")
+            conn.select(_imap_folder(arguments.get("from_folder", "INBOX")))
             if account.get("provider") == "gmail":
                 conn.uid("COPY", uid, _imap_folder(folder))
                 conn.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
@@ -450,7 +508,7 @@ async def call_tool(name: str, arguments: dict):
         elif name == "babushka_move_email":
             uid = arguments["uid"]
             to_folder = arguments["to_folder"]
-            conn.select("INBOX")
+            conn.select(_imap_folder(arguments.get("from_folder", "INBOX")))
             if account.get("provider") == "gmail":
                 conn.uid("COPY", uid, _imap_folder(to_folder))
                 conn.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
@@ -458,19 +516,6 @@ async def call_tool(name: str, arguments: dict):
             else:
                 conn.uid("MOVE", uid, to_folder)
             return [TextContent(type="text", text=f"Moved email {uid} to {to_folder} ({account_label})")]
-
-        elif name == "babushka_send_email":
-            to_addr = arguments["to"]
-            subject = arguments["subject"]
-            body = arguments["body"]
-            msg = MIMEText(body)
-            msg["From"] = account["email"]
-            msg["To"] = to_addr
-            msg["Subject"] = subject
-            smtp = get_smtp_connection(account)
-            smtp.send_message(msg)
-            smtp.quit()
-            return [TextContent(type="text", text=f"Sent email to {to_addr}: {subject} ({account_label})")]
 
         elif name == "babushka_create_folder":
             folder_name = arguments["folder_name"]
@@ -485,10 +530,10 @@ async def call_tool(name: str, arguments: dict):
             folder_names = []
             for f in folders:
                 decoded = f.decode()
-                # Parse IMAP folder list format
-                parts = decoded.split(' "/" ')
-                if len(parts) == 2:
-                    folder_names.append(parts[1].strip('"'))
+                # Parse IMAP LIST response: (flags) "delimiter" name
+                match = re.match(r'\(.*?\)\s+"(.+?)"\s+(.+)', decoded)
+                if match:
+                    folder_names.append(match.group(2).strip('"'))
             result = {"account": account_label, "folders": folder_names}
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
@@ -500,7 +545,7 @@ async def call_tool(name: str, arguments: dict):
     finally:
         try:
             conn.logout()
-        except:
+        except Exception:
             pass
 
 

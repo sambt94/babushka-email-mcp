@@ -3,14 +3,12 @@
     {
       "name": "iCloud",
       "provider": "icloud",
-      "email": "your@icloud.com",
-      "password": "xxxx-xxxx-xxxx-xxxx"
+      "email": "your@icloud.com"
     },
     {
       "name": "Gmail",
       "provider": "gmail",
-      "email": "your@gmail.com",
-      "password": "xxxx-xxxx-xxxx-xxxx"
+      "email": "your@gmail.com"
     }
   ]
 }

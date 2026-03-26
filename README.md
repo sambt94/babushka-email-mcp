@@ -45,14 +45,11 @@ Run the setup script:
 uv run python setup.py
 ```
 
-This creates a `config.json` with your email and app password. (This file is gitignored and never pushed.)
+This creates a `config.json` with your account details (no passwords stored on disk) and outputs the MCP configuration with your passwords as environment variables.
 
-Or create it manually from the template:
+Or set it up manually:
 
-```bash
-cp config.example.json config.json
-# Edit config.json with your details
-```
+**a) Create `config.json`** (account info only, no passwords):
 
 ```json
 {
@@ -60,14 +57,12 @@ cp config.example.json config.json
     {
       "name": "iCloud",
       "provider": "icloud",
-      "email": "your@icloud.com",
-      "password": "xxxx-xxxx-xxxx-xxxx"
+      "email": "your@icloud.com"
     },
     {
       "name": "Gmail",
       "provider": "gmail",
-      "email": "your@gmail.com",
-      "password": "xxxx xxxx xxxx xxxx"
+      "email": "your@gmail.com"
     }
   ]
 }
@@ -75,20 +70,24 @@ cp config.example.json config.json
 
 Provider options: `icloud`, `gmail`, `outlook`. You can add as many accounts as you like.
 
-### 4. Add the MCP server to Claude Code
-
-Add this to `~/.claude/.mcp.json` (global) or your project's `.mcp.json`:
+**b) Add the MCP server** to `~/.claude/.mcp.json` (global) or your project's `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "babushka": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/babushka-god-mode", "python", "server.py"]
+      "args": ["run", "--directory", "/path/to/babushka-email-mcp", "python", "server.py"],
+      "env": {
+        "BABUSHKA_ICLOUD_PASSWORD": "xxxx-xxxx-xxxx-xxxx",
+        "BABUSHKA_GMAIL_PASSWORD": "xxxx xxxx xxxx xxxx"
+      }
     }
   }
 }
 ```
+
+Passwords are passed as environment variables (`BABUSHKA_<ACCOUNT_NAME>_PASSWORD`), not stored in config.json. The env var name is derived from your account name — e.g., an account named "Work Gmail" becomes `BABUSHKA_WORK_GMAIL_PASSWORD`.
 
 For **Claude Desktop**, add the same to `~/Library/Application Support/Claude/claude_desktop_config.json`.
 

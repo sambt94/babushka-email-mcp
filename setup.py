@@ -1,6 +1,7 @@
 # ABOUTME: One-time setup script for Babushka God Mode.
 # ABOUTME: Walks users through connecting email accounts and saves config.json.
 
+import getpass
 import json
 from pathlib import Path
 
@@ -49,7 +50,7 @@ def add_account():
 
     name = input(f"Account name [{default_name}]: ").strip() or default_name
     email_addr = input(f"Your {provider} email address: ").strip()
-    password = input("App-specific password (paste it here): ").strip()
+    password = getpass.getpass("App-specific password (paste it here): ").strip()
 
     return {
         "name": name,
@@ -108,32 +109,43 @@ def setup():
         print("\nNo accounts configured. Run this again when you're ready, dear.")
         return
 
-    config = {"accounts": accounts}
+    # Separate passwords from config — passwords go in MCP env, not on disk
+    passwords = {}
+    config_accounts = []
+    for acc in accounts:
+        env_key = f"BABUSHKA_{acc['name'].upper().replace(' ', '_')}_PASSWORD"
+        passwords[env_key] = acc["password"]
+        config_accounts.append({
+            "name": acc["name"],
+            "provider": acc["provider"],
+            "email": acc["email"],
+        })
+
+    config = {"accounts": config_accounts}
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
 
     print()
     print("=" * 40)
-    print(f"✅ Saved {len(accounts)} account(s) to config.json")
+    print(f"✅ Saved {len(accounts)} account(s) to config.json (no passwords stored)")
     print()
     print("Next: Add the MCP server to Claude Code.")
     print()
-    print("Option A — Global (all projects):")
-    print(f"  Add this to ~/.claude/.mcp.json:")
+    print("Add this to ~/.claude/.mcp.json (global) or")
+    print("~/Library/Application Support/Claude/claude_desktop_config.json (Desktop):")
     print()
     mcp_config = {
         "mcpServers": {
             "babushka": {
                 "command": "uv",
                 "args": ["run", "--directory", str(SERVER_DIR), "python", "server.py"],
+                "env": passwords,
             }
         }
     }
     print(json.dumps(mcp_config, indent=2))
     print()
-    print("Option B — Claude Desktop:")
-    print("  Add the same config to:")
-    print("  ~/Library/Application Support/Claude/claude_desktop_config.json")
+    print("Your passwords are passed as environment variables, not stored in config.json.")
     print()
     print("Then open Claude Code and say: \"scan my inbox\"")
     print()
